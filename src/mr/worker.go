@@ -1,12 +1,18 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
-
-//
 // Map functions return a slice of KeyValue.
 //
 type KeyValue struct {
@@ -31,14 +37,138 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	for {
+		args := TaskArgs{}
+		reply := TaskReply{}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		ok := call("Coordinator.RequestTask", &args, &reply)
+		if !ok {
+			return
+		}
 
+		var err error
+		switch reply.TaskType {
+		case "Map":
+			err = runMapTask(&reply, mapf)
+		case "Reduce":
+			err = runReduceTask(&reply, reducef)
+		case "Wait":
+			time.Sleep(time.Second)
+			continue
+		case "Exit":
+			return
+		default:
+			return
+		}
+		if err != nil {
+			return
+		}
+		completed := TaskDoneArgs{TaskID: reply.TaskID, TaskType: reply.TaskType}
+		if !call("Coordinator.CompleteTask", &completed, &TaskDoneReply{}) {
+			return
+		}
+	}
 }
 
-//
+func runMapTask(task *TaskReply, mapf func(string, string) []KeyValue) error {
+	content, err := os.ReadFile(task.FileName)
+	if err != nil {
+		return err
+	}
+	if task.NReduce <= 0 {
+		return fmt.Errorf("invalid reduce count %d", task.NReduce)
+	}
+	buckets := make([][]KeyValue, task.NReduce)
+	for _, kv := range mapf(task.FileName, string(content)) {
+		reduceID := ihash(kv.Key) % task.NReduce
+		buckets[reduceID] = append(buckets[reduceID], kv)
+	}
+	for reduceID, bucket := range buckets {
+		file, err := os.CreateTemp(".", "mr-map-*")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(file.Name())
+		writer := bufio.NewWriter(file)
+		encoder := json.NewEncoder(writer)
+		for _, kv := range bucket {
+			if err := encoder.Encode(&kv); err != nil {
+				file.Close()
+				return err
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			file.Close()
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		filename := fmt.Sprintf("mr-%d-%d", task.TaskID, reduceID)
+		if err := os.Rename(file.Name(), filename); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runReduceTask(task *TaskReply, reducef func(string, []string) string) error {
+	var intermediate []KeyValue
+	for mapID := 0; mapID < task.NMap; mapID++ {
+		filename := fmt.Sprintf("mr-%d-%d", mapID, task.TaskID)
+		file, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+		decoder := json.NewDecoder(bufio.NewReader(file))
+		for {
+			var kv KeyValue
+			if err := decoder.Decode(&kv); err == io.EOF {
+				break
+			} else if err != nil {
+				file.Close()
+				return err
+			}
+			intermediate = append(intermediate, kv)
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+	file, err := os.CreateTemp(".", "mr-reduce-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	writer := bufio.NewWriter(file)
+	for i := 0; i < len(intermediate); {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := make([]string, 0, j-i)
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+		if _, err := fmt.Fprintf(writer, "%v %v\n", intermediate[i].Key, output); err != nil {
+			return err
+		}
+		i = j
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), fmt.Sprintf("mr-out-%d", task.TaskID))
+}
+
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
