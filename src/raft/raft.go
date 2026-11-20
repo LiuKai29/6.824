@@ -22,10 +22,14 @@ import (
 
 	//"crypto/rand"
 	//"fmt"
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.824/labgob"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
@@ -106,33 +110,38 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(rf.votedFor) != nil ||
+		e.Encode(rf.log) != nil {
+		fmt.Printf("Encoder Failed\n")
+		return
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil { // bootstrap without any state?
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -183,8 +192,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 // example RequestVote RPC handler.
@@ -214,6 +225,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		rf.votedFor = args.CandidateID
 		rf.resetElectionTimerLocked()
+		rf.persist()
 		return
 	} else {
 		reply.VoteGranted = false
@@ -228,6 +240,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = false
 	reply.Term = rf.currentTerm
+	reply.ConflictTerm = 0
+	reply.ConflictIndex = 0
 	if args.Term < rf.currentTerm {
 		return
 	}
@@ -235,10 +249,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.resetElectionTimerLocked()
 	reply.Term = rf.currentTerm
 
-	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.log) {
+	if args.PrevLogIndex < 0 {
+		return
+	}
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictTerm = 0 // 不存在
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = args.PrevLogIndex
+		for reply.ConflictIndex > 0 && rf.log[reply.ConflictIndex-1].Term == reply.ConflictTerm {
+			reply.ConflictIndex--
+		}
 		return
 	}
 	for i, log := range args.Entries {
@@ -263,6 +287,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	reply.Success = true
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -336,7 +361,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
 	rf.broadcastHeartbeatsLocked()
-
+	rf.persist()
 	return index, term, isLeader
 }
 
@@ -370,6 +395,7 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 		rf.votedFor = -1
 	}
 	rf.state = Follower
+	rf.persist()
 }
 
 func (rf *Raft) becomeLeaderLocked() {
@@ -385,6 +411,8 @@ func (rf *Raft) startElectionLocked() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
+
 	rf.resetElectionTimerLocked()
 	lastIndex := len(rf.log) - 1
 	args := RequestVoteArgs{
@@ -455,18 +483,42 @@ func (rf *Raft) sendHeartbeat(server int, args AppendEntriesArgs) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// 如果 reply 的 Term 高于自己的 currentTerm,自动退回 candidate 开启第二次选举
-	if !rf.killed() && reply.Term > rf.currentTerm {
+	if rf.killed() {
+		return
+	}
+	if reply.Term > rf.currentTerm {
 		rf.becomeFollowerLocked(reply.Term)
 		rf.resetElectionTimerLocked()
+		return
+	}
+	if rf.state != Leader || rf.currentTerm != args.Term {
+		return
 	}
 	if !reply.Success {
-		rf.nextIndex[server]-- // 回退 nextIndex
-		if rf.nextIndex[server] < 1 {
-			rf.nextIndex[server] = 1
+		if args.PrevLogIndex <= rf.matchIndex[server] || rf.nextIndex[server] != args.PrevLogIndex+1 {
+			return
 		}
+		next := reply.ConflictIndex
+		if reply.ConflictTerm != 0 {
+			for i := len(rf.log) - 1; i >= 0; i-- {
+				if rf.log[i].Term == reply.ConflictTerm {
+					next = i + 1
+					break
+				}
+			}
+		}
+		if next < rf.matchIndex[server]+1 {
+			next = rf.matchIndex[server] + 1
+		}
+		rf.nextIndex[server] = next
 	} else {
-		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		matched := args.PrevLogIndex + len(args.Entries)
+		if matched > rf.matchIndex[server] {
+			rf.matchIndex[server] = matched
+		}
+		if rf.nextIndex[server] < rf.matchIndex[server]+1 {
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+		}
 	}
 	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 		count := 0
