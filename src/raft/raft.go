@@ -21,7 +21,7 @@ import (
 	//	"bytes"
 
 	//"crypto/rand"
-
+	//"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -302,11 +302,8 @@ func (rf *Raft) sendAppendEntries(
 	args *AppendEntriesArgs,
 	reply *AppendEntriesReply,
 ) bool {
-	return rf.peers[server].Call(
-		"Raft.AppendEntries",
-		args,
-		reply,
-	)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -322,11 +319,23 @@ func (rf *Raft) sendAppendEntries(
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+
 	index := -1
 	term := -1
 	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term, isLeader = rf.currentTerm, (rf.state == Leader)
+	if !isLeader {
+		return -1, term, isLeader
+	}
+
+	rf.log = append(rf.log, LogEntry{Command: command, Term: term})
+	index = len(rf.log) - 1
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+	rf.broadcastHeartbeatsLocked()
 
 	return index, term, isLeader
 }
@@ -407,7 +416,7 @@ func (rf *Raft) startElectionLocked() {
 				rf.resetElectionTimerLocked()
 				return
 			}
-			// 成为 Leader or 退回 Follower || currentTerm 已经改变 
+			// 成为 Leader or 退回 Follower || currentTerm 已经改变
 			// || 回复的 Term 与本轮 Term 不同 选票无效
 			if rf.state != Candidate || rf.currentTerm != args.Term || reply.Term != args.Term {
 				return
@@ -431,7 +440,7 @@ func (rf *Raft) broadcastHeartbeatsLocked() {
 		prevLogIndex := rf.nextIndex[server] - 1
 		args := AppendEntriesArgs{
 			Term: rf.currentTerm, LeaderID: rf.me,
-			PrevLogIndex: prevLogIndex, PrevLogTerm: rf.log[prevLogIndex].Term,
+			PrevLogIndex: prevLogIndex, PrevLogTerm: rf.log[prevLogIndex].Term, Entries: rf.log[rf.nextIndex[server]:],
 			LeaderCommit: rf.commitIndex,
 		}
 		go rf.sendHeartbeat(server, args)
@@ -450,6 +459,27 @@ func (rf *Raft) sendHeartbeat(server int, args AppendEntriesArgs) {
 		rf.becomeFollowerLocked(reply.Term)
 		rf.resetElectionTimerLocked()
 	}
+	if !reply.Success {
+		rf.nextIndex[server]-- // 回退 nextIndex
+		if rf.nextIndex[server] < 1 {
+			rf.nextIndex[server] = 1
+		}
+	} else {
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+	}
+	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+		count := 0
+		for i := range rf.peers {
+			if rf.matchIndex[i] >= N && rf.log[N].Term == rf.currentTerm {
+				count++
+			}
+		}
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = N
+			break
+		}
+	}
 }
 
 // Check timers without waiting for any RPC to return.
@@ -461,7 +491,23 @@ func (rf *Raft) ticker() {
 				rf.broadcastHeartbeatsLocked() // 广播 Heartbeat
 			}
 		} else if time.Since(rf.lastHeartbeat) >= rf.electionTimeout {
-			rf.startElectionLocked()  // 超时产生选举
+			rf.startElectionLocked() // 超时产生选举
+		}
+		rf.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) applier(applyCh chan ApplyMsg) {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
 		}
 		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
@@ -502,5 +548,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	// Raft code apply msg to tester via channel
+	go rf.applier(applyCh)
 	return rf
 }
