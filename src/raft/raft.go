@@ -96,7 +96,9 @@ type Raft struct {
 
 	state State
 
-	// TODO: 使用 offsetIndex 来记录日志的偏移量
+	snapShot []byte
+	applyCh  chan ApplyMsg
+
 	// 所有 Index 均代表 Absolute Index, 即相对于整个日志的 Index
 	// 访问 log 时需要使用 log[index - offsetIndex] 来访问
 	offsetIndex int
@@ -160,14 +162,79 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.votedFor = votedFor
 	rf.log = log
 	rf.offsetIndex = offsetIndex
+	rf.offsetTerm = offsetTerm
+}
+
+func (rf *Raft) sendInstallSnapshot(servers int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	// Raft 之间通信
+	ok := rf.peers[servers].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+
+	// 拒绝过期的 Leader 请求
+	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+	rf.becomeFollowerLocked(args.Term)
+	rf.resetElectionTimerLocked()
+
+	// 比当前快照还旧，直接忽略
+	if args.LastIncludedIndex <= rf.offsetIndex {
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.mu.Unlock()
+
+	// 只通知上层，不在 Raft 层修改状态
+	// 状态变更由上层调用 CondInstallSnapshot 完成
+	rf.applyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (2D).
+	// Raft 在发出 ApplyMsg 之后，可能又 apply 了更新的日志条目。
+	// 如果上层已经 apply 到比这个 snapshot 更新的位置，拒绝安装。
+	if lastIncludedIndex <= rf.lastApplied {
+		return false
+	}
 
+	// snapshot 仍然是最新的，正式安装：裁剪日志
+	if lastIncludedIndex < rf.offsetIndex+len(rf.log) {
+		// log 中还有 lastIncludedIndex 之后的条目，保留
+		rf.log = rf.log[rf.AbsoluteIndexToLogIndex(lastIncludedIndex):]
+		rf.log[0].Term = lastIncludedTerm
+	} else {
+		// snapshot 覆盖了全部 log，重置为只含 dummy entry 的日志
+		rf.log = make([]LogEntry, 1)
+		rf.log[0].Term = lastIncludedTerm
+	}
+
+	rf.offsetIndex = lastIncludedIndex
+	rf.offsetTerm = lastIncludedTerm
+	rf.snapShot = snapshot
+
+	// 更新 lastApplied / commitIndex，防止 applier 重复 apply 旧条目
+	rf.lastApplied = lastIncludedIndex
+	if rf.commitIndex < lastIncludedIndex {
+		rf.commitIndex = lastIncludedIndex
+	}
+
+	rf.SaveStateAndSnapshot()
 	return true
 }
 
@@ -178,6 +245,51 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
+	// TODO:Client 对 raft 进行通知
+	// 已经生成了 Snapshot，可以删除对应的旧日志，并持久化快照
+	// Index 传入的为 Absolute Index, 即相对于整个日志的 Index
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.offsetIndex || index >= len(rf.log)+rf.offsetIndex {
+		return
+	}
+
+	log := make([]LogEntry, 1, len(rf.log)-rf.AbsoluteIndexToLogIndex(index))
+	log[0].Term = rf.log[rf.AbsoluteIndexToLogIndex(index)].Term
+	rf.log = append(log, rf.log[rf.AbsoluteIndexToLogIndex(index)+1:]...)
+	rf.offsetIndex = index
+	rf.offsetTerm = log[0].Term
+	rf.snapShot = snapshot
+	rf.SaveStateAndSnapshot()
+}
+
+func (rf *Raft) SaveStateAndSnapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	for _, value := range []interface{}{rf.currentTerm, rf.votedFor, rf.log, rf.offsetIndex, rf.offsetTerm} {
+		if e.Encode(value) != nil {
+			fmt.Printf("Encoder Failed\n")
+			return
+		}
+	}
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, rf.snapShot)
+}
+
+func (rf *Raft) readSnapshot(data []byte) ApplyMsg {
+	if data == nil {
+		return ApplyMsg{SnapshotValid: false}
+	}
+	// TODO: 读取 Snapshot 数据，并更新 Raft 的状态
+	rf.snapShot = data
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      data,
+		SnapshotTerm:  rf.offsetTerm,
+		SnapshotIndex: rf.offsetIndex,
+	}
+	return msg
 }
 
 // example RequestVote RPC arguments structure.
@@ -214,6 +326,19 @@ type AppendEntriesReply struct {
 	Success       bool
 	ConflictTerm  int
 	ConflictIndex int
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	Leader            int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
 
 // example RequestVote RPC handler.
@@ -480,18 +605,61 @@ func (rf *Raft) startElectionLocked() {
 }
 
 func (rf *Raft) broadcastHeartbeatsLocked() {
+	// TODO: SendSnapshot
 	rf.lastHeartbeatSent = time.Now()
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
+
+		if rf.nextIndex[server] <= rf.offsetIndex {
+			args := InstallSnapshotArgs{
+				Term:              rf.currentTerm,
+				Leader:            rf.me,
+				LastIncludedIndex: rf.offsetIndex,
+				LastIncludedTerm:  rf.offsetTerm,
+				Data:              rf.snapShot,
+				Done:              true,
+			}
+			go rf.sendSnapshot(server, args)
+			continue
+		}
+
 		prevLogIndex := rf.nextIndex[server] - 1
+		log := rf.log[rf.AbsoluteIndexToLogIndex(rf.nextIndex[server]):]
 		args := AppendEntriesArgs{
 			Term: rf.currentTerm, LeaderID: rf.me,
-			PrevLogIndex: prevLogIndex, PrevLogTerm: rf.log[rf.AbsoluteIndexToLogIndex(prevLogIndex)].Term, Entries: rf.log[rf.AbsoluteIndexToLogIndex(rf.nextIndex[server]):],
+			PrevLogIndex: prevLogIndex, PrevLogTerm: rf.log[rf.AbsoluteIndexToLogIndex(prevLogIndex)].Term, Entries: log,
 			LeaderCommit: rf.commitIndex,
 		}
 		go rf.sendHeartbeat(server, args)
+	}
+}
+
+func (rf *Raft) sendSnapshot(server int, args InstallSnapshotArgs) {
+	reply := InstallSnapshotReply{}
+	if !rf.sendInstallSnapshot(server, &args, &reply) {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.killed() {
+		return
+	}
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollowerLocked(reply.Term)
+		rf.resetElectionTimerLocked()
+		return
+	}
+	if rf.state != Leader || rf.currentTerm != args.Term {
+		return
+	}
+	// 更新该 Follower 的复制进度
+	if rf.matchIndex[server] < args.LastIncludedIndex {
+		rf.matchIndex[server] = args.LastIncludedIndex
+	}
+	if rf.nextIndex[server] < args.LastIncludedIndex+1 {
+		rf.nextIndex[server] = args.LastIncludedIndex + 1
 	}
 }
 
@@ -573,15 +741,19 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applier(applyCh chan ApplyMsg) {
 	for !rf.killed() {
 		rf.mu.Lock()
+		var msgs []ApplyMsg
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
-			applyCh <- ApplyMsg{
+			msgs = append(msgs, ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[rf.AbsoluteIndexToLogIndex(rf.lastApplied)].Command,
 				CommandIndex: rf.lastApplied,
-			}
+			})
 		}
 		rf.mu.Unlock()
+		for _, msg := range msgs {
+			applyCh <- msg
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -601,6 +773,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
@@ -617,11 +790,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	if msg := rf.readSnapshot(persister.ReadSnapshot()); msg.SnapshotValid {
+		go func() { rf.applyCh <- msg }()
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	// Raft code apply msg to tester via channel
-	go rf.applier(applyCh)
+	go rf.applier(rf.applyCh)
 	return rf
 }
